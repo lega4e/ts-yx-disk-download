@@ -40,7 +40,7 @@ export interface FolderNode {
 process.env.yxdisktoken;
 
 export default class YXDownloader {
-  private readonly brigade = new Brigade(10);
+  private readonly brigade = new Brigade(100);
 
   constructor(
     private readonly token: string,
@@ -48,6 +48,7 @@ export default class YXDownloader {
   ) {}
 
   failedFiles: string[] = [];
+  successFiles: string[] = [];
 
   async init() {
     this.brigade.init();
@@ -114,32 +115,118 @@ export default class YXDownloader {
   async downloadFile(diskPath: string, localPath: string): Promise<void> {
     console.log(`↓ ${diskPath} → ${localPath}`);
 
-    try {
-      const href = await this.getDownloadLink(diskPath);
+    const MAX_RETRIES = 5;
+    const SPEED_BYTES_PER_SEC = 50 * 1024;
+    const TIMEOUT_BUFFER_SEC = 10; // запас на установку соединения и т.п.
 
-      const res = await fetch(href, {
-        headers: {
-          Authorization: `OAuth ${this.token}`,
-        },
-        redirect: 'follow',
-      });
+    let lastError: unknown = null;
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        // 1. Узнаём размер файла, чтобы посчитать timeout
+        const meta = await this.apiGet<{ size?: number }>('/resources', {
+          path: diskPath,
+          fields: 'size',
+        });
+        const size = meta.size ?? 0;
+
+        // timeout = время на скачивание + небольшой буфер
+        // если размер неизвестен — ставим 10 минут
+        const timeoutMs =
+          size > 0
+            ? Math.ceil((size / SPEED_BYTES_PER_SEC + TIMEOUT_BUFFER_SEC) * 1000)
+            : 10 * 60 * 1000;
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+        try {
+          const href = await this.getDownloadLink(diskPath);
+
+          const res = await fetch(href, {
+            headers: {
+              Authorization: `OAuth ${this.token}`,
+            },
+            redirect: 'follow',
+            signal: controller.signal,
+          });
+
+          if (!res.ok) {
+            // 429 Too Many Requests — можно ретраить
+            if (res.status === 429) {
+              throw Object.assign(new Error(`HTTP 429 Too Many Requests`), {
+                retryable: true,
+              });
+            }
+            // остальные HTTP-ошибки — без ретраев
+            throw Object.assign(new Error(`HTTP ${res.status}`), {
+              retryable: false,
+            });
+          }
+
+          await mkdir(dirname(localPath), { recursive: true });
+          const fileStream = createWriteStream(localPath);
+          // @ts-ignore
+          await pipeline(Readable.fromWeb(res.body as any), fileStream);
+
+          console.log(`✓ Готово: ${localPath}`);
+          this.successFiles.push(localPath);
+          return; // успех — выходим
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      } catch (err) {
+        lastError = err;
+        const message = err instanceof Error ? err.message : String(err);
+        const lower = message.toLowerCase();
+
+        // Timeout (AbortError) — НЕ ретраим
+        const isTimeout =
+          err instanceof Error && (err.name === 'AbortError' || message.includes('aborted'));
+
+        // Явно помеченные как retryable или 429
+        const isRetryable =
+          !isTimeout &&
+          ((err as any)?.retryable === true ||
+            lower.includes('429') ||
+            lower.includes('too many requests') ||
+            lower.includes('fetch failed') ||
+            lower.includes('terminated') ||
+            lower.includes('network') ||
+            lower.includes('econnreset') ||
+            lower.includes('etimedout') ||
+            lower.includes('enotfound') ||
+            lower.includes('econnrefused') ||
+            lower.includes('socket hang up'));
+
+        if (isTimeout) {
+          console.error(
+            `✗ Таймаут при скачивании ${diskPath} (превышена ожидаемая скорость ${SPEED_BYTES_PER_SEC / 1024} КБ/с)`,
+          );
+          this.failedFiles.push(diskPath);
+          return;
+        }
+
+        if (isRetryable && attempt < MAX_RETRIES) {
+          const delaySec = attempt * 2 + Math.random() * 3; // 2с, 4с, 6с...
+          console.warn(
+            `⚠ Попытка ${attempt}/${MAX_RETRIES} не удалась (${message}). Повтор через ${delaySec}с...`,
+          );
+          await new Promise((r) => setTimeout(r, delaySec * 1000));
+          continue;
+        }
+
+        // Неретраибельная ошибка или закончились попытки
+        console.error(`✗ Ошибка при скачивании ${diskPath}: ${message}`);
+        this.failedFiles.push(diskPath);
+        return;
       }
-
-      await mkdir(dirname(localPath), { recursive: true });
-
-      const fileStream = createWriteStream(localPath);
-      // @ts-ignore — Readable.fromWeb есть в Node 18+
-      await pipeline(Readable.fromWeb(res.body as any), fileStream);
-
-      console.log(`✓ Готово: ${localPath}`);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`✗ Ошибка при скачивании ${diskPath}: ${message}`);
-      this.failedFiles.push(diskPath);
     }
+
+    // На всякий случай (сюда почти не попадаем)
+    const message = lastError instanceof Error ? lastError.message : String(lastError);
+    console.error(`✗ Ошибка при скачивании ${diskPath}: ${message}`);
+    this.failedFiles.push(diskPath);
   }
 
   /**
@@ -196,6 +283,7 @@ export default class YXDownloader {
     await this.brigade.submitMany(
       files.map((item) => {
         return async () => {
+          await new Promise((r) => setTimeout(r, Math.random() * 30 * 1000));
           const localPath = join(localDir, item.name);
           if (options.skipExisting) {
             try {

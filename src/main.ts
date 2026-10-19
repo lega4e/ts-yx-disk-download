@@ -73,7 +73,9 @@ async function main() {
     for (const file of yx.failedFiles) {
       console.log(`- ${file}`);
     }
-    console.log(`Всего ошибок: ${yx.failedFiles.length}`);
+    const total = yx.failedFiles.length + yx.successFiles.length;
+    console.log(`Всего ошибок: ${yx.failedFiles.length}/${total}`);
+    console.log(`Успешно: ${yx.successFiles.length}/${total}`);
   } else {
     console.log('\nВсё скачано без ошибок!');
   }
